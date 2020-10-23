@@ -1,2 +1,2 @@
-# classification-system
+# recommender-system
 capstone project harvardX
