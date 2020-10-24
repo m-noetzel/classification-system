@@ -1,0 +1,1092 @@
+---
+title: 'Report Recommender Project | HarvardX Data Science Professional Certificate'
+author: "Martin Noetzel"
+date: "10/23/2020"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    fig_caption: true
+---
+
+\newpage
+\tableofcontents
+\newpage
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+# 1. Introduction
+
+This report is a requirement of the 9th course of the Data Science Professional Program provided by HarvardX (Irizarry, 2020). The goal was to build an algorithm (a so called model) which can be used to recommend unknown movies to specific user. In Detail the algorithm will predict a rating that a specific user would have most probably given if he had seen it. As a basis of the predictions the algorithm will be trained on a set of user ratings for other movies.
+
+In practice I used a data set provided by GroupLens research lab (Sou, 2018) which contains of 10 million ratings applied to 10,681 movies by 71,567 users. The data set was randomly split into two separate sets:
+
+1) A training set (referred to in later code as edx data set) which contains about 90% of the data
+2) A validation set that contains 10% of the data
+
+The training set was used to train different models in order to define a final model. The validation set however was only used to validate the final model and to ensure the comparison of the model performance through all course participants.
+
+Before running the R code in your console you have to ensure that these packages are loaded.
+
+```{r load packages, echo=F, results='hide',message=FALSE}
+library(plyr)
+library(tidyverse)
+library(broom)
+library(caret)
+library(dslabs)
+library(dplyr)
+library(lubridate)
+library(MASS)
+library(matrixStats)
+library(pdftools)
+library(gridExtra)
+library(purrr)
+library(genefilter)
+library(stringr)
+library(stringi)
+library(reshape2)
+library(data.table)
+library(recosystem)
+```
+
+Below you can see the code we used to generate the two sets.
+
+```{r Generate the data sets,results='hide', message=F}
+if(!require(tidyverse)) install.packages("tidyverse",
+                                    repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", 
+                                     repos = "http://cran.us.r-project.org")
+if(!require(data.table)) install.packages("data.table", 
+                                      repos = "http://cran.us.r-project.org")
+
+dl <- tempfile()
+download.file("http://files.grouplens.org/datasets/movielens/ml-10m.zip", dl)
+
+ratings <- fread(text = gsub("::", "\t", 
+                readLines(unzip(dl, "ml-10M100K/ratings.dat"))),
+                 col.names = c("userId", "movieId", "rating", "timestamp"))
+
+movies <- str_split_fixed(readLines(unzip(dl,
+                "ml-10M100K/movies.dat")), "\\::", 3)
+
+colnames(movies) <- c("movieId", "title", "genres")
+
+movies <- as.data.frame(movies) %>% mutate(movieId = as.numeric(movieId),
+                                           title = as.character(title),
+                                           genres = as.character(genres))
+movielens <- left_join(ratings, movies, by = "movieId")
+
+set.seed(1, sample.kind="Rounding")
+test_index <- createDataPartition(y = movielens$rating, times = 1, p = 0.1, list = FALSE)
+edx <- movielens[-test_index,]
+temp <- movielens[test_index,]
+```
+To ensure every user in the validation set has at least some ratings in the training set we run the following code provided by the course staff.
+
+```{r match data sets,results='hide', message=F}
+validation <- temp %>% 
+  semi_join(edx, by = "movieId") %>%
+  semi_join(edx, by = "userId")
+
+removed <- anti_join(temp, validation)
+edx <- rbind(edx, removed)
+
+rm(dl, ratings, movies, test_index, temp, movielens, removed)
+```
+
+The project's goal is to develop a model which will calculate ratings equal or as close as possible to real ratings given by users. The model performance will be measured by rmse (root mean squared error). The rmse measures the sum of all deviations from the relating real values (referd to as loss function). It is defined as:
+
+RMSE = sqrt(mean(y_hat-y)^2^), where y is the real value (rating) and y_hat is the corresponding prediction.
+
+In order to earn the most possible points (or highest grade) my aim was to find a model with an rmse below 0.8490.
+
+To calculate the rmse a specific function was defined by the course instructor:
+
+```{r RMSE function,results='hide',message=FALSE}
+
+RMSE <- function(true_ratings, predicted_ratings){
+  sqrt(mean((true_ratings - predicted_ratings)^2))
+}
+```
+
+This report consist of four main section:
+
+1) __Introduction__ - overview, project goal and project structure
+2) __Analysis__ - data cleaning, data exploring, gained insights and approach
+3) __Results__ - results and model performance
+4) __Conclusion__ - summary, limitations and recommendations for further improvements
+
+# 2. Analysis
+## 2.1 Data Pre-processing
+
+The first step for me was to families myself with the provided data set. The code below gives an overview of the data structure and the included variables.
+
+```{r Overview of dataset}
+head(edx)
+```
+
+The data consist of the 6 variables (items) and 9.000.055 items. The following points draw my attention while watching this table:
+
+* The variable "timestamp" is not formatted at all
+* The variable "year" (meaning the release year) is bind to the variable "title"
+* The variable "genres" contains of items that consist of more then one genre
+
+In order to address these issues I performed the steps below:
+
+1) The variable "timestamp" was formatted as datetime. The original variable was overwritten with the new values:
+
+```{r formatting the timestamp variable,results='hide',message=FALSE,echo=F}
+edx <- edx %>% mutate(timestamp=as_datetime(timestamp))
+```
+
+2) I extracted the variable "release year" from the variable "title" and stored the results in a new variable called "year". Since I did not expect me to do something with the variable "title" and to reduce processing time of operations I deleted the variable from the edx data set:
+
+```{r extracting the release year,message=FALSE, echo=F}
+edx$year <- substr(edx$title ,nchar(as.character(edx$title))-4,nchar(as.character(edx$title))-1)
+year <- edx %>% group_by(movieId) %>% summarize(years=year[1])
+edx <- edx %>% dplyr::select(-year,-title)
+head(year)
+```
+
+3) I generated dummy variables of all genres and stored them separately to hold the edx data clean and tidy:
+
+```{r generate genres dummy variables,message=FALSE,echo=F}
+### Generate dummy variables for the variable genres
+genre <- edx %>%
+  group_by(movieId) %>%
+  dplyr::select(movieId,genres) %>%
+  mutate(gComedy = ifelse(str_detect(genres,"Comedy"),1,0)) %>%
+  mutate(gAction = ifelse(str_detect(genres,"Action"),1,0)) %>%
+  mutate(gCrime = ifelse(str_detect(genres,"Crime"),1,0)) %>%
+  mutate(gThriller = ifelse(str_detect(genres,"Thriller"),1,0)) %>%
+  mutate(gSci_Fi = ifelse(str_detect(genres,"Sci_Fi"),1,0)) %>%
+  mutate(gDrama = ifelse(str_detect(genres,"Drama"),1,0)) %>%
+  mutate(gFantasy = ifelse(str_detect(genres,"Fantasy"),1,0)) %>%
+  mutate(gAdventure = ifelse(str_detect(genres,"Adventure"),1,0)) %>%
+  mutate(gWar = ifelse(str_detect(genres,"War"),1,0)) %>%
+  mutate(gChildren = ifelse(str_detect(genres,"Children"),1,0)) %>%
+  mutate(gRomance = ifelse(str_detect(genres,"Romance"),1,0)) %>%
+  mutate(gAnimation = ifelse(str_detect(genres,"Animation"),1,0)) %>%
+  mutate(gMystical = ifelse(str_detect(genres,"Mystical"),1,0)) %>%
+  mutate(gMusical = ifelse(str_detect(genres,"Musical"),1,0)) %>% distinct_all() %>%
+  dplyr::select(-genres)
+head(genre)
+```
+
+4) Since one of my assumption was that the ratings have specific age effects I defined two new variables which measure the age of a every rating that was given to a specific movie (movie age effect) or the age of ratings from a specific user (user age effect):
+
+* A variable "age_movie" - days past since a specific movie received its first rating
+* A variable "age_user" -  days past since a specific user rated his first movie
+
+To generate the new variables I first had to identify the first timestamp each specific movie received to get a reference point. Then I calculated the new variable and defined the min and max values in order to be able to define appropriate cluster. In a final step I standardized the new variable and called it age_movie_s.
+
+```{r Generate variables DaysPast,message=FALSE}
+firstRating_movie <- edx %>%
+  dplyr::select(movieId,timestamp) %>%
+  group_by(movieId) %>%
+  summarise(firstRating_movie=min(timestamp)) %>%
+  arrange(-desc(movieId))
+
+age_movie <- edx %>%
+  left_join(firstRating_movie ,by="movieId") %>%
+  mutate(age_i =round(difftime(timestamp,firstRating_movie,units = "days"))) %>%
+  group_by(movieId) %>%
+  dplyr::select(age_i,userId,rating)
+
+max(age_movie$age_i)
+min(age_movie$age_i)
+
+age_movie_s <- age_movie %>% 
+  mutate(days_i=ifelse(age_i<=1000,"1000",
+                     ifelse(age_i<=2000,"2000",
+                            ifelse(age_i<=3000,"3000",
+                                   ifelse(age_i<=4000,"4000",
+                                          ifelse(age_i<=5000,"5000","6000"))))))
+```
+
+So the new variable looked like this.
+
+```{r, message=F, echo=F}
+age_movie_s <- age_movie_s %>% dplyr::select(-rating,-age_i)
+head(age_movie_s)
+```
+
+
+The second variable was generated similarly.
+
+```{r, echo=F, message=F, echo=F}
+# Age user
+# to calculate the variable "age_user" the first timestamp given by a specific user has to 
+# be calculated to get a reference point.
+firstRating_user <- edx %>%
+  dplyr::select(userId,timestamp) %>%
+  group_by(userId) %>%
+  summarise(firstRating_user=min(timestamp)) %>%
+  arrange(-desc(userId))
+
+age_user <- edx %>%
+  left_join(firstRating_user ,by="userId") %>%
+  mutate(age_u =round(difftime(timestamp,firstRating_user,units = "days"))) %>%
+  group_by(userId) %>%
+  dplyr::select(age_u,movieId,rating)
+
+# calculate the max,min values to pick the scale for a useful cluster
+max(age_user$age_u)
+min(age_user$age_u)
+
+# standardize cluster
+age_user_s <- age_user %>% 
+  mutate(days_u=ifelse(age_u<=1000,"1000",
+                       ifelse(age_u<=2000,"2000",
+                              ifelse(age_u<=3000,"3000",
+                                     ifelse(age_u<=4000,"4000","5000")))))
+
+age_user_s <- age_user_s %>% dplyr::select(-rating,-age_u)
+
+# remove some data from the environment 
+rm(age_movie,age_user)
+```
+
+```{r, echo=F, message=F}
+head(age_user_s)
+```
+
+
+I then checked all variables for missing values with negative results.
+
+```{r check for NAs, message=F}
+any(is.na(year))
+any(is.na(genre))
+any(is.na(age_movie_s))
+any(is.na(age_user_s))
+```
+
+
+## 2.2 Data Exploration
+
+The goal of the data exploration step was to analyze the data in order to get insights which could be used to build better models. To make it easier for you to follow through I gave this section the fixed structure.
+
+For each variable firstly I will give you overall information about the data structure. Secondly I will show you a visualization of of the data and a description of what we can see. And finally I will interpret the results, derive insights from it and will then conclude what it means for the modeling approach.
+
+
+### 2.2.1 User Id
+
+The overall structure of the variable "userId" looks like this:
+
+```{r overall structure userId,message=FALSE,echo=F}
+edx %>% group_by(userId) %>%
+  summarise(n=n()) %>% head()
+```
+
+The variable contains of 69878 specific numerical rows. Each one represents one specific user. You can see in the table that the times a specific user rated a movie differs a lot across user. The diagram below shows the rating distribution of all user.
+
+```{r rating distribution,message=FALSE,echo=F}
+# User Ratings
+edx %>% group_by(userId) %>%
+  summarise(bu=mean(rating)) %>%
+  ggplot(aes(bu)) +
+  geom_histogram(bins = 30,color="black") +
+  ggtitle("User")
+```
+
+Most users in the data set gave ratings between 3 and 4. But there are also some user with average ratings of 1 or 5 stars. 
+
+That means that the user effect (bu) should account for a significant part of the variance of the ratings. In other words. Including the "movie" variable in our model should increase the model performance.
+
+
+### 2.2.2 Movie Id
+
+The table below shows an overview of the variable "movieId". The edx data set contains of 10677 different movies, each of them was rated at least from one user. But again you can see that there are movies that received substantially less or more ratings then the average movie.
+
+```{r overall structure movieId,message=FALSE,echo=F}
+edx %>% group_by(movieId) %>%
+  summarise(n=n()) %>% head()
+```
+
+When we evaluate the distribution of ratings for different movies we see that most of them were rated on average between 3 and 4 stars. Nevertheless there are also movies which average ratings of just one star or also movies that got the highest avarege rating of 5 stars.
+
+```{r,message=FALSE, echo=F}
+# Movie Ratings
+edx %>% group_by(movieId) %>%
+  summarise(bi=mean(rating)) %>%
+  ggplot(aes(bi)) +
+  geom_histogram(bins = 30,color="black") +
+  ggtitle("Movie")
+```
+
+Given that plot it is likely that the movie effect plays a fundamental role in the predictability of movie ratings. So I assume it will account for a big part of the performance of our final model.
+
+
+### 2.2.3 Year
+
+The variable year represents the release year and was extracted from the title. The data consists of 10677 individual release years, one for each movie.
+
+If you look at the plot shown below you will recognize that the average rating per year (by) negatively correlates with the year.
+
+```{r Ratings by year cluster,message=FALSE,echo=F}
+edx %>% left_join(year ,by="movieId") %>%
+  group_by(years) %>%
+  summarise(AvRating =mean(rating)) %>%
+  ggplot(aes(years,AvRating)) +
+  geom_point() +
+  theme(text = element_text(size=7),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  ggtitle("Year")
+```
+
+As "by" is only the average rating per year I would expect that very old movies have a greater variance since the sample size of ratings is small compared to years in the nearer past. To account for that issue I decided to cluster the year in different time phases. The boxplot diagram below shows the distribution. It appears that the average rating drops during the time phases. Nevertheless the effect is not very strong.  
+
+```{r,results='hide',message=FALSE,echo=F, results='hide'}
+# Check the min,max year to define appropriate cluster
+min(year$years)
+max(year$years)
+
+# standardize the variable "year"
+year_s <- year %>%
+  mutate(time_phase=ifelse(years<=1950,"40er or less",
+                       ifelse(years<=1960,"50er",
+                              ifelse(years<=1970,"60er",
+                                  ifelse(years<=1980,"70er",
+                                         ifelse(years<=1990,"80er",
+                                                ifelse(years<=2000,"90er",
+                                                      ifelse(years<=2004,"early 2000","late 2000"))))))))
+# remove some data from the environment 
+rm(year)
+```
+
+```{r boxplot time phases, echo=F}
+edx %>%
+  left_join(year_s ,by="movieId") %>%
+  group_by(time_phase) %>%
+  ggplot(aes(time_phase,rating)) +
+  geom_boxplot(alpha=0.7) +
+  stat_summary(fun=mean,geom="point", shape=20, size=3, color="red", fill="red") +
+  ggtitle("Year") 
+```
+
+I decided to still include this variable in my models, in good hope that it will improve the performance to at least some amount.
+
+
+### 2.2.4 Genres
+
+The variable "genres" in the edx data set exist of 16 different genres. The fixed binding of genre combination results in 797 individual genre combinations.
+
+```{r,message=FALSE}
+edx %>% group_by(genres) %>% summarise(n=n()) %>% nrow()
+```
+
+The table below shows the most important genres as they received the most user ratings.
+
+```{r table genres, echo=F}
+top_genres <- edx %>%
+  group_by(genres) %>% 
+  mutate(n=count(rating), avRating=mean(rating)) %>%
+  dplyr::select(genres,avRating,n) %>%
+  distinct(genres,.keep_all =T) %>%
+  arrange(desc(n)) %>% head(10)
+top_genres
+```
+
+The average rating varies across these genres which indicates some amount of predictive power. To clarify this I calculated a boxplot chart with the corresponding underlying data.
+
+
+```{r boxplot top10 genres, echo=F}
+edx %>% filter(genres %in% top_genres$genres) %>%
+  group_by(genres) %>%
+  ggplot(aes(y = reorder(genres, rating,FUN = mean), x=rating)) +
+  geom_boxplot(alpha=0.7) +
+  stat_summary(fun=mean,geom="point", shape=20, size=3, color="red", fill="red") +
+  ggtitle("Top 10 most rated genres") 
+```
+T
+his chart highlights very clearly that both, the variance as well as the mean varies across those genres.
+
+Thus I will include the variable "genres" in my models.
+
+
+### 2.2.5 Age effect
+
+As the age variables measure the past days since the first rating from each user (variable "age_user") or for each movie (variable "age_movie") respectively, both variables have 7200091 items. Below I looked at each variable separately:
+
+1) __Age_user__ 
+The following table shows the prevalence of ratings within each defined cluster:
+
+```{r number of ratings age_u,message=FALSE, echo=F}
+age_user_s %>% 
+  group_by(days_u) %>% summarise(n=n())
+```
+
+What we see is that the distribution is very skewed and the most of the values are in the first, second or third cluster. To evaluate the variance within each cluster and to compare the defined cluster I calculated a corresponding boxplot chart.
+
+
+```{r age_user boxplots,message=FALSE, echo=F}
+edx %>% left_join(age_user_s,by=c("movieId","userId")) %>% 
+  group_by(days_u) %>%
+  ggplot(aes(x = days_u, y=rating)) +
+  geom_boxplot(alpha=0.7) +
+  stat_summary(fun=mean,geom="point", shape=20, size=3, color="red", fill="red") +
+  ggtitle("Age_user")
+```
+
+As you can derive from the figure above the variable "age_user" has nearly zero variance across all cluster. Only the last cluster shows some degree of variance and a slight shift of the mean. However as we have seen above the last cluster has no weight in the data set as it accounts for only a very small amount of ratings. Therefore I decided to not use these variable any further.
+
+2) __Age_movie__
+I performed the same analysis for the second age variable.
+
+```{r daysPast_movie distribution and boxplot,message=FALSE,echo=F}
+age_movie_s %>% 
+  group_by(days_i) %>% summarise(n=n())
+
+edx %>% left_join(age_movie_s,by=c("movieId","userId")) %>% 
+  group_by(days_i) %>%
+  ggplot(aes(x = days_i, y=rating)) +
+  geom_boxplot(alpha=0.7) +
+  stat_summary(fun=mean,geom="point", shape=20, size=3, color="red", fill="red") +
+  ggtitle("Age_movie")
+```
+
+We can see a similar pattern here. However the variance within the cluster above 5000 days appears to be more stable and accounts for far more ratings. These are the reasons I decided to include this variable in my models.
+
+
+## 2.3 Modeling approach
+### 2.3.1 Baseline model
+
+A typical modeling approach as described in the book "Super Forecasting" by Philip Tetlock and Dan Gardner (2015) contains of a baseline prediction as well as additional terms which can decrease or increase the baseline prediction and accounts for additional identified biases within the data set (or additional specific information if the context is different from machine learning). Another term, called the error term, will account for all the variance that can not be explained by the data. As we will consider the predictors "movieId", "userId", "year" (time phase), "genres" and "age_movie" in our model it can be formally written as:
+
+
+**y_hat** **=** **mu** **+** **bi** **+** **bu** **+** **by** **+** **bg** **+** **ba** **+** **e**
+
+
+What follows is a short description of the formula parts:
+
+* **y_hat** - the prediction of a specific rating
+* **mu** - the mean of all ratings in the training data set
+* **bi** - the movie bias, which represents the variance of ratings due to a movie effect
+* **bu** - the user bias, which represents the variance of ratings due to a user effect
+* **by** - the year bias, which represents the variance of ratings due to a time phase effect
+* **bg** - the genre bias, which represents the variance of ratings due to a genre effect
+* **ba** - the age bias, which represents the variance of ratings that can be explained with the days past since a specific movie received its first rating
+
+
+### 2.3.2 Regularization
+
+When we calculate biases, eg. the user bias, we analyze specific (user) ratings in order to find correlations between specific users (groups of users) and their related ratings. The smaller the sample, the less robust will be the bias. Or in other words. We should only trust the calculated biases, and thus adapt our baseline prediction, if the pattern is based on a great enough sample so the effect is robust.
+
+To make sure we give more robust biases a greater weight we will use the regularization concept and constrain the total variability of the effect sizes. We will use lambda as a the regularization parameter that shrinks the deviation from the mean (baseline) towards zero. In order to find the best lambda I minimized the following formula, where y is the real value (rating):
+
+```{r model formula with regularization}
+# ∑(y - mu - bi - bu - by - bg - ba)^2 + lambda(∑bi^2 + ∑bu^2 + ∑by^2 + ∑bg^2 + ∑ba^2)
+```
+
+
+### 2.3.3 Data Partition
+
+To ensure that we can properly evaluate our models in order to find the final model we separated our edx data set in two parts:
+
+1) __training_set__ - 80% of all edx items, randomly picked to train our models, tune the model parameter and define the final model
+2) __test_set__ - 20 % of the edx data set, randomly picked to evaluate the final model
+
+
+The figure below shows the corresponding R code:
+
+```{r Data Partition,results='hide',message=FALSE}
+
+set.seed(1234, sample.kind = "Rounding")
+test_index <- createDataPartition(edx$rating,times = 1,p=0.2,list = F)
+train_set <- edx[-test_index,]
+test_set0 <- edx[test_index,]
+
+test_set <- test_set0 %>% 
+  semi_join(train_set, by = "movieId") %>%
+  semi_join(train_set, by = "userId") %>%
+  semi_join(train_set, by="genres")
+
+removed <- anti_join(test_set0, test_set)
+edx <- rbind(train_set, removed)
+
+rm(removed, test_set0)
+```
+
+
+As soon as I defined the final model I rerun the code with the complete edx data set and evaluated the model with the validation set. This operation delivered the final RMSE.
+
+
+# 3. Results
+
+In this section I will show the results of all models I trained during the training phase. I trained them first on the train_set and tuned possible model parameters. In a second step I evaluated every model on the validation set in order to compare results with all course participants. Of course I never used the validation set for training purposes as I know this would yield to over-fitting.
+
+The simplest prediction would be to use the average of all ratings in the edx set to predict the ratings in the validation set:
+
+```{r mean train_set,message=FALSE, echo=F}
+mean(edx$rating)
+```
+```{r Calculate rmse_av,echo=F,message=F,results=F,echo=F}
+prediction_av <- validation %>% mutate(results_av=mean(edx$rating)) %>%
+  pull(results_av)
+
+rmse_av <- RMSE(prediction_av,validation$rating)
+  
+```
+
+I stored all results in a table called "rmse_results".
+```{r result table,message=FALSE,echo=F}
+# Write the result 
+rmse_results <- tibble(Model="Average",  
+                                     RMSE = rmse_av)
+rmse_results
+```
+So the first approach would yield to an rmse greater then 1, which means that our predictions would be on average 1 star above or below the real rating. I think there is much room for improvement.
+
+
+## 3.1 Model 1 - movie effect and regularization
+
+The first real model I trained was the linear model with regularization on the variable "movieId". I used cross-validation to find the best lambda.
+
+
+```{r,echo=F,message=F}
+lambdas <- seq(0, 10, 0.25)
+
+rmses_lm <- sapply(lambdas, function(l){
+  
+  mu <- mean(train_set$rating)
+  
+  bi <- train_set %>% 
+    group_by(movieId) %>%
+    summarize(bi = sum(rating - mu)/(n()+l))
+  
+  predicted_ratings <- test_set %>% 
+    left_join(bi, by = "movieId") %>%
+    mutate(pred = mu + bi) %>%
+    pull(pred)
+  
+  return(RMSE(predicted_ratings, test_set$rating))
+})
+
+qplot(lambdas, rmses_lm)  
+lambdas[which.min(rmses_lm)]
+```
+
+
+You can see that lambda = 2.25 minimizes the rmse and was the best tuning parameter. With the code below I trained the final model.
+
+
+```{r validate model 1, results=F, message=F}
+mu <- mean(edx$rating)
+  
+  bi <- edx %>% 
+    group_by(movieId) %>%
+    summarize(bi = sum(rating - mu)/(n()+2.25))
+  
+  predicted_ratings_1 <- validation %>% 
+    left_join(bi, by = "movieId") %>%
+    mutate(pred = mu + bi) %>%
+    pull(pred)
+```
+
+Assuming I would submit this model as my final one I would reach the following rmse on the validation set:
+
+```{r, rmse results1}
+rmse_1 <- RMSE(predicted_ratings_1,validation$rating)
+
+rmse_results <- bind_rows(rmse_results,
+                          tibble(Model="Movie effect and reg",  
+                                     RMSE = rmse_1))
+rmse_results
+```
+The first model archived an rmse of approximately 0.94, which is significantly better then just the average.
+
+
+## 3.2 Model 2 - movie effect, user effect and regularization
+
+I repeated the procedure above a couple of times, always adding another variable to the model to measure the impact on the model performance. In model 2 I included the variable "userId".
+
+```{r,echo=F,message=F,echo=F}
+lambdas <- seq(0, 10, 0.25)
+
+rmses_lm <- sapply(lambdas, function(l){
+  
+  mu <- mean(train_set$rating)
+  
+  bi <- train_set %>% 
+    group_by(movieId) %>%
+    summarize(bi = sum(rating - mu)/(n()+l))
+    
+  bu <- train_set %>% 
+    left_join(bi, by="movieId") %>%
+    group_by(userId) %>%
+    summarize(bu = sum(rating - bi - mu)/(n()+l))
+  
+  predicted_ratings <- test_set %>% 
+    left_join(bi, by = "movieId") %>%
+    left_join(bu, by = "userId") %>%
+    mutate(pred = mu + bi + bu) %>%
+    pull(pred)
+  
+  return(RMSE(predicted_ratings, test_set$rating))
+})
+
+qplot(lambdas, rmses_lm)  
+lambdas[which.min(rmses_lm)]
+```
+
+So the best value for the tuning parameter lambda turned out to be 4.75. Let us check how model 2 would perform on the validation set.
+
+```{r validate model 2, results=F, message=F,echo=F}
+
+bi <- edx %>% 
+  group_by(movieId) %>%
+  summarize(bi = sum(rating - mu)/(n()+4.75))
+
+bu <- edx %>% 
+  left_join(bi, by="movieId") %>%
+  group_by(userId) %>%
+  summarize(bu = sum(rating - bi - mu)/(n()+4.75))
+
+prediction_2 <- validation %>% 
+  left_join(bi, by = "movieId") %>%
+  left_join(bu, by = "userId") %>%
+  mutate(pred = mu + bi + bu) %>%
+  pull(pred)
+
+rmse_2 <- RMSE(prediction_2, validation$rating)
+```
+
+The user effect reduced the rmse significantly. That means we observe a strong user effect within the data. Or in other words, the variable "userId" had strong predictive power.
+
+```{r, rmse results2, message=F,echo=F}
+# Write the result 
+rmse_results <- bind_rows(rmse_results,
+                          tibble(Model="Movie effect, user effect and reg",  
+                                     RMSE = rmse_2))
+
+rmse_results
+```
+
+
+## 3.3 Model 3 - movie effect, user effect, time effect and regularization
+
+In model 3 I added the variable "time_phase" to model 2.
+
+```{r, echo=F, message=F, echo=F}
+lambdas <- seq(0, 10, 0.25)
+
+rmses_lm <- sapply(lambdas, function(l){
+  
+  mu <- mean(train_set$rating)
+  
+  bi <- train_set %>% 
+    group_by(movieId) %>%
+    summarize(bi = sum(rating - mu)/(n()+l))
+    
+  bu <- train_set %>% 
+    left_join(bi, by="movieId") %>%
+    group_by(userId) %>%
+    summarize(bu = sum(rating - bi - mu)/(n()+l))
+  
+   by <- train_set %>%
+  left_join(bi, by="movieId") %>%
+  left_join(bu, by="userId") %>%
+  left_join(year_s, by="movieId") %>%
+  group_by(time_phase) %>%
+  summarize(by = sum(rating - bi - bu - mu)/(n()+l))
+  
+  predicted_ratings <- test_set %>% 
+    left_join(bi, by = "movieId") %>%
+    left_join(bu, by = "userId") %>%
+    left_join(year_s, by="movieId") %>%
+    left_join(by, by = "time_phase") %>%
+    mutate(pred = mu + bi + bu + by) %>%
+    pull(pred)
+  
+  return(RMSE(predicted_ratings, test_set$rating))
+})
+
+qplot(lambdas, rmses_lm)  
+lambdas[which.min(rmses_lm)]
+```
+
+As before the best value for the tuning parameter was 4.75.
+
+```{r validate model 3, results=F, message=F,echo=F}
+
+bi <- edx %>% 
+  group_by(movieId) %>%
+  summarize(bi = sum(rating - mu)/(n()+4.75))
+
+bu <- edx %>% 
+  left_join(bi, by="movieId") %>%
+  group_by(userId) %>%
+  summarize(bu = sum(rating - bi - mu)/(n()+4.75))
+
+by <- edx %>%
+  left_join(bi, by="movieId") %>%
+  left_join(bu, by="userId") %>%
+  left_join(year_s, by="movieId") %>%
+  group_by(time_phase) %>%
+  summarize(by = sum(rating - bi - bu - mu)/(n()+4.75))
+
+prediction_3 <- validation %>% 
+  left_join(bi, by = "movieId") %>%
+  left_join(bu, by = "userId") %>%
+  left_join(year_s, by="movieId") %>%
+  left_join(by, by = "time_phase") %>%
+  mutate(pred = mu + bi + bu + by) %>%
+  pull(pred)
+
+rmse_3 <- RMSE(prediction_3, validation$rating)
+```
+
+The added time variable had nearly no effect at all. The rmse improved just a tiny bit. Focusing on the pre-processing-process could had helped to separate the signal better from the noise. Nevertheless I thought this variable had just not that much predictive power overall.
+
+```{r, rmse results3, message=F,echo=F}
+# Write the result 
+rmse_results <- bind_rows(rmse_results,
+                          tibble(Model="Movie effect, user effect, time phase effect and reg",  
+                                     RMSE = rmse_3))
+
+rmse_results
+```
+
+
+## 3.4 Model 4 - movie effect, user effect, time effect, genre effect and regularization
+
+In this section I added the genre variable in their raw form. 
+
+```{r, echo=F, message=F, echo=F}
+rmses_lm <- sapply(lambdas, function(l){
+  
+  mu <- mean(train_set$rating)
+  
+  bi <- train_set %>% 
+    group_by(movieId) %>%
+    summarize(bi = sum(rating - mu)/(n()+l))
+    
+  bu <- train_set %>% 
+    left_join(bi, by="movieId") %>%
+    group_by(userId) %>%
+    summarize(bu = sum(rating - bi - mu)/(n()+l))
+  
+  by <- train_set %>%
+  left_join(bi, by="movieId") %>%
+  left_join(bu, by="userId") %>%
+  left_join(year_s, by="movieId") %>%
+  group_by(time_phase) %>%
+  summarize(by = sum(rating - bi - bu - mu)/(n()+l))
+   
+  bg <- train_set %>%
+  left_join(bi, by="movieId") %>%
+  left_join(bu, by="userId") %>%
+  left_join(year_s, by="movieId") %>%
+  left_join(by, by="time_phase") %>%
+  group_by(genres) %>%
+  summarize(bg = sum(rating - bi - bu - by - mu)/(n()+l))
+  
+  predicted_ratings <- test_set %>% 
+    left_join(bi, by = "movieId") %>%
+    left_join(bu, by = "userId") %>%
+    left_join(year_s, by="movieId") %>%
+    left_join(by, by = "time_phase") %>%
+    left_join(bg, by = "genres") %>%
+    mutate(pred = mu + bi + bu + by + bg) %>%
+    pull(pred)
+  
+  return(RMSE(predicted_ratings, test_set$rating))
+})
+
+qplot(lambdas, rmses_lm)  
+lambdas[which.min(rmses_lm)]
+```
+The tuning parameter lambda did not change.
+
+```{r validate model 4, results=F, message=F, echo=F}
+
+bi <- edx %>% 
+  group_by(movieId) %>%
+  summarize(bi = sum(rating - mu)/(n()+4.75))
+
+bu <- edx %>% 
+  left_join(bi, by="movieId") %>%
+  group_by(userId) %>%
+  summarize(bu = sum(rating - bi - mu)/(n()+4.75))
+
+by <- edx %>%
+  left_join(bi, by="movieId") %>%
+  left_join(bu, by="userId") %>%
+  left_join(year_s, by="movieId") %>%
+  group_by(time_phase) %>%
+  summarize(by = sum(rating - bi - bu - mu)/(n()+4.75))
+
+bg <- edx %>%
+  left_join(bi, by="movieId") %>%
+  left_join(bu, by="userId") %>%
+  left_join(year_s, by="movieId") %>%
+  left_join(by,by="time_phase") %>%
+  group_by(genres) %>%
+  summarize(bg = sum(rating - bi - bu - by - mu)/(n()+4.75))
+
+prediction_4 <- validation %>% 
+  left_join(bi, by = "movieId") %>%
+  left_join(bu, by = "userId") %>%
+  left_join(year_s, by="movieId") %>%
+  left_join(by, by = "time_phase") %>%
+  left_join(bg, by = "genres") %>%
+  mutate(pred = mu + bi + bu + by + bg) %>%
+  pull(pred)
+
+rmse_4 <- RMSE(prediction_4, validation$rating)
+```
+
+Again the added variable genre decreased the rmse just slightly and had no significant effect on the model performance.
+
+```{r, rmse results4, message=F,echo=F}
+# Write the result 
+rmse_results <- bind_rows(rmse_results,
+                          tibble(Model="Movie effect, user effect, time phase effect, genre effect and reg",  
+                                     RMSE = rmse_4))
+
+rmse_results
+```
+
+
+## 3.5 Model 5 - movie effect, user effect, time effect, genre effect, age effect and regularization
+
+Finally I included the variable "age_movie" variable to the model and was excited about whether it would push us over the rmse target line of < 0.8649.
+
+```{r,results='hide',message=FALSE,echo=F}
+
+lambdas <- seq(0, 10, 0.25)
+
+rmses_lm <- sapply(lambdas, function(l){
+  
+  mu <- mean(train_set$rating)
+  
+  bi <- train_set %>% 
+    group_by(movieId) %>%
+    summarize(bi = sum(rating - mu)/(n()+l))
+  
+  bu <- train_set %>% 
+    left_join(bi, by="movieId") %>%
+    group_by(userId) %>%
+    summarize(bu = sum(rating - bi - mu)/(n()+l))
+  
+  by <- train_set %>%
+  left_join(bi, by="movieId") %>%
+  left_join(bu, by="userId") %>%
+  left_join(year_s, by="movieId") %>%
+  group_by(time_phase) %>%
+  summarize(by = sum(rating - bi - bu - mu)/(n()+l))
+  
+  bg <- train_set %>%
+  left_join(bi, by="movieId") %>%
+  left_join(bu, by="userId") %>%
+  left_join(year_s, by="movieId") %>%
+  left_join(by, by="time_phase") %>%
+  group_by(genres) %>%
+  summarize(bg = sum(rating - bi - bu - by - mu)/(n()+l))
+  
+  ba <- train_set %>%
+    left_join(bi, by="movieId") %>%
+    left_join(bu, by="userId") %>%
+    left_join(year_s, by="movieId") %>%
+    left_join(by, by="time_phase") %>%
+    left_join(bg, by="genres") %>%
+    left_join(age_movie_s, by=c("userId","movieId")) %>%
+    group_by(days_i) %>%
+    summarize(ba = sum(rating - bi - bu - by - bg - mu)/(n()+l))
+  
+  predicted_ratings <- test_set %>% 
+    left_join(bi, by = "movieId") %>%
+    left_join(bu, by = "userId") %>%
+    left_join(year_s, by="movieId") %>%
+    left_join(by, by = "time_phase") %>%
+    left_join(bg, by = "genres") %>%
+    left_join(firstRating_movie ,by="movieId") %>%
+    mutate(age_i =round(difftime(timestamp,firstRating_movie,units = "days"))) %>%
+    mutate(days_i=ifelse(age_i<=1000,"1000",
+                       ifelse(age_i<=2000,"2000",
+                              ifelse(age_i<=3000,"3000",
+                                     ifelse(age_i<=4000,"4000",
+                                            ifelse(age_i<=5000,"5000","6000")))))) %>%
+    left_join(ba, by="days_i") %>%
+    mutate(pred = mu + bi + bu + by + bg + ba) %>%
+    pull(pred)
+  
+  return(RMSE(predicted_ratings, test_set$rating))
+})
+
+qplot(lambdas, rmses_lm)  
+lambdas[which.min(rmses_lm)]
+```
+
+The tuning parameter changed to 5.
+
+```{r validate model 5, results=F, message=F}
+
+bi <- edx %>% 
+  group_by(movieId) %>%
+  summarize(bi = sum(rating - mu)/(n()+5))
+
+bu <- edx %>% 
+  left_join(bi, by="movieId") %>%
+  group_by(userId) %>%
+  summarize(bu = sum(rating - bi - mu)/(n()+5))
+
+by <- edx %>%
+  left_join(bi, by="movieId") %>%
+  left_join(bu, by="userId") %>%
+  left_join(year_s, by="movieId") %>%
+  group_by(time_phase) %>%
+  summarize(by = sum(rating - bi - bu - mu)/(n()+5))
+
+bg <- edx %>%
+  left_join(bi, by="movieId") %>%
+  left_join(bu, by="userId") %>%
+  left_join(year_s, by="movieId") %>%
+  left_join(by,by="time_phase") %>%
+  group_by(genres) %>%
+  summarize(bg = sum(rating - bi - bu - by - mu)/(n()+5))
+
+ba <- edx %>%
+  left_join(bi, by="movieId") %>%
+  left_join(bu, by="userId") %>%
+  left_join(year_s, by="movieId") %>%
+  left_join(by, by="time_phase") %>%
+  left_join(bg, by="genres") %>%
+  left_join(age_movie_s, by=c("userId","movieId")) %>%
+  group_by(days_i) %>%
+  summarize(ba = sum(rating - bi - bu - by - bg - mu)/(n()+5))
+
+prediction_5 <- validation %>% 
+  left_join(bi, by = "movieId") %>%
+  left_join(bu, by = "userId") %>%
+  left_join(year_s, by="movieId") %>%
+  left_join(by, by = "time_phase") %>%
+  left_join(bg, by = "genres") %>%
+  left_join(firstRating_movie ,by="movieId") %>%
+  mutate(timestamp=as_datetime(timestamp)) %>%
+  mutate(age_i = round(difftime(timestamp,firstRating_movie,units = "days"))) %>%
+  mutate(days_i=ifelse(age_i<=1000,"1000",
+                     ifelse(age_i<=2000,"2000",
+                            ifelse(age_i<=3000,"3000",
+                                   ifelse(age_i<=4000,"4000",
+                                          ifelse(age_i<=5000,"5000","6000")))))) %>%
+  left_join(ba, by="days_i") %>%
+  mutate(pred = mu + bi + bu + by + bg + ba) %>%
+  pull(pred)
+
+rmse_5 <- RMSE(prediction_5, validation$rating)
+```
+
+It turned out that the added variable "age_movie" reduced the rmse further. However not enough to reach the performance to earn the highest grade. In order to reach that goal I had to describe, test and train a new model, that focuses on matrix factorization. 
+
+```{r, rmse results5, message=F,echo=F}
+# Write the result 
+rmse_results <- bind_rows(rmse_results,
+                          tibble(Model="Movie effect, user effect, time phase effect, genre effect, age effect and reg",  
+                                     RMSE = rmse_5))
+
+rmse_results
+```
+
+## 3.6 Model 6 - matrix factorisation
+
+I decided to try the matrix factorization technique as it is well known as a good fit for recommender system and it was also a topic we discussed in our course (see Introduction to Data Science, Rafael A. Irizarry, 2020).
+
+The goal of the algorithm is to decompose a user-item interaction matrix into the product of two rectangular matrices with lower dimensions. So linear algebra is used to reduce the complexity of the matrix and to calculate factors like movie popularity or user activeness and their specific weights. I will not describe the whole concept mathematically in this report. But interested readers can find a good introduction into that topic in the recommended course book above.
+
+
+### 3.6.1 Data Preparation
+
+To build a matrix factorization model I used the "recosystem" package. The package was developed by Yu-Chin Juan, Wei-Sheng Chin, Yong Zhuang, Bo-Wen Yuan, Meng-Yuan Yang, and Chih-Jen Lin in 2015 and can be installed and loaded similar to other packages at the Rstudio environment. I picked this package, because it is designed for matrix factorization problems and also very resource efficient, which is fundamentally important in our case (think about how big our data set is!).
+
+Three steps were necessary to prepare the data for the training phase:
+
+1) The recosystem package needs the data to be in a sparse matrix triplet form. Meaning both the training set and the validation set needed to have 3 columns. One for the user, one for the movie and the third for the rating.
+
+```{r,results='hide', message=F}
+edx_m <- edx %>% dplyr::select(userId,movieId, rating)
+edx_m <- as.matrix(edx_m)
+
+validation_m <- validation %>% dplyr::select(userId, movieId,rating)
+validation_m <- as.matrix(validation_m)
+```
+
+2) It was also necessary to write the data into a hard disc before training the model to ensure efficiency.
+
+```{r,results='hide', message=F}
+write.table(edx_m ,file = "trainset.txt",sep = " " ,row.names = F,col.names = F)
+write.table(validation_m,file = "validset.txt",sep = " " ,row.names = F, col.names = F)
+```
+
+
+3) The final data sets had to be generated
+
+```{r, results='hide', message=F}
+set.seed(202)
+training <- data_file("trainset.txt")
+validating <- data_file("validset.txt")
+```
+
+
+### 3.6.2 Building the model
+
+First of all I built a recommender model using this code:
+
+```{r, message=F, results=F}
+r <- Reco()
+```
+
+Then I tuned the training set to get the best possible parameter for the training phase:
+
+```{r, message=F}
+opts <- r$tune(training, opts = list(dim = c(10, 20, 30), lrate = c(0.1, 0.2),
+                                      costp_l1 = 0, costq_l1 = 0,
+                                      nthread = 1, niter = 10))
+opts
+```
+
+I finally trained the matrix factorization model using the parameters above that minimizes the rmse.
+
+```{r, message=F}
+r$train(training,opts = c(opts$min,nthread=1,niter=20))
+```
+
+### 3.6.3 Validation of the model
+
+As I had the final model I used the predict function on the r object to generate the prediction for the validation set. Then I run these predictions through our RMSE function in order to calculate the final rmse_mf.
+
+```{r, message=F, results=F}
+pred_file <- tempfile()
+r$predict(validating,out_file(pred_file))
+predicted_ratings_mf <- scan(pred_file)
+
+rmse_mf <- RMSE(predicted_ratings_mf, validation$rating)
+```
+
+```{r, message=F, echo=F}
+rmse_results <- bind_rows(rmse_results,
+                          tibble(Model="Matrix factorization",  
+                                     RMSE = rmse_mf))
+rmse_results
+```
+
+
+I was surprised about the result and how much the matrix factorization model improved the rmse. I could archive a really good result of approximately 0.79 on the validation set. That is an improvement of nearly 8% in comparison to model 5. Note that I only used the variable "userId" and "movieId" in matrix factorization model.
+
+\newpage
+
+# 4. Conclusion
+
+In summary I trained and tuned 6 different models on the training data set and validated them on the validation set. It turned out, that linear models are appropriate for our data in general. Especially to built a good baseline model, that is highly superior compared to just predicting the average. But the final goal of an rmse of less then 0.86490 could I only archive through introducing the matrix factorization technique that got me to an rmse of 0.79.
+
+The matrix factorization model turned out to be superior to linear models in gathering the signal when it comes to the dynamic interaction of user, movie pairs. The reason is that this technique is able to capture factors, eg. user activeness or movie popularity. I think a combination of both techniques, the linear models for the baseline prediction and matrix factorization for the more dynamic relationship, would yield to even better results.
+
+If I were able to spent more time on that project I would have focused longer on the data pre-processing step. I think there is a great potential to isolate the signals of different predictors further. I read about "feature engineering" and it seems like it is a good approach to harvest the most possible amount of the signal from a specific predictor. Thus I will dig deeper into that topic in the future.
+
+For further improvements I will also suggest to include ensembles of models, because it is very likely that the "many model approach", especially if the individual models are uncorrelated, improve the performance compared to even the best single model.
+
+Actually I tried to train some ensemble models with the "caretEnsemble" package but was not able to run the code due to limitations of my computer resources.
+
+To sum up my report I have to say that I really liked the project, learned a lot and want to thank the whole instructor team, especially Prof. Irizarry, for putting together such a valuable program. I also want to thank all my peers for the interesting discussions (even if online) and their support.
+
+
